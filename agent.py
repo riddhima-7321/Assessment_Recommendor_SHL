@@ -1,28 +1,7 @@
 """
 agent.py
-────────
-Conversational agent that maps hiring intent → SHL assessment shortlist.
 
-Architecture
-────────────
-                    ┌─────────────────────────────┐
-  POST /chat        │         AgentRouter          │
-  (full history) ─► │  classify_intent()           │
-                    │    ├─ VAGUE   → ask 1 Q      │
-                    │    ├─ READY   → retrieve+rec │
-                    │    ├─ REFINE  → re-retrieve  │
-                    │    ├─ COMPARE → grounded diff│
-                    │    └─ OFF_TOPIC → refuse      │
-                    └─────────────────────────────┘
-
-LLM: Groq (llama-3.1-8b-instant) — free tier, ~200 tok/s, 6k RPM.
-     Falls back to Gemini Flash if GROQ_API_KEY not set.
-
-The LLM is called twice per turn at most:
-  1. Intent classification (tiny prompt, JSON output, ~100 tokens)
-  2. Reply generation (larger system prompt with injected catalog context)
-
-This keeps latency well under the 30-second timeout even on free tiers.
+agent for mapping hiring reqs to SHL assessments
 """
 
 from __future__ import annotations
@@ -31,37 +10,49 @@ import json
 import logging
 import os
 import re
+
 from typing import Any
 
 from groq import Groq
 from dotenv import load_dotenv
+
 load_dotenv()
+
 from catalog import SHLCatalog
 
 log = logging.getLogger(__name__)
 
-# ── LLM client ───────────────────────────────────────────────────────────────
+
+# llm client
 
 _groq_client: Groq | None = None
 
 
 def _get_client() -> Groq:
+
     global _groq_client
+
     if _groq_client is None:
+
         api_key = os.environ.get("GROQ_API_KEY", "")
+
         if not api_key:
             raise RuntimeError(
                 "GROQ_API_KEY environment variable is not set. "
                 "Get a free key at https://console.groq.com"
             )
+
         _groq_client = Groq(api_key=api_key)
+
     return _groq_client
 
 
-MODEL = "llama-3.1-8b-instant"   # free, fast
-CLASSIFY_MODEL = MODEL            # same model for classification (cheap call)
+MODEL = "llama-3.1-8b-instant"
 
-# ── Prompts ───────────────────────────────────────────────────────────────────
+CLASSIFY_MODEL = MODEL
+
+
+# prompts
 
 SYSTEM_PROMPT = """You are an expert SHL assessment advisor embedded in the SHL product catalog. Your only job is to help hiring managers and recruiters find the right SHL assessments for a specific role.
 
@@ -84,6 +75,7 @@ Always respond with a JSON object with exactly these keys:
   ],
   "end_of_conversation": false
 }
+
 - "recommendations" is [] when still gathering context or refusing.
 - "recommendations" has 1–10 items when committing to a shortlist.
 - "end_of_conversation" is true only when you believe the user's need is fully addressed.
@@ -100,6 +92,7 @@ P = Personality & Behavior
 S = Simulations
 """
 
+
 CLASSIFY_PROMPT = """Classify the hiring manager's latest intent from this conversation.
 
 Output ONLY a JSON object — no markdown, no explanation:
@@ -110,24 +103,27 @@ Output ONLY a JSON object — no markdown, no explanation:
 }
 
 Intent definitions:
-- VAGUE: not enough info to recommend (no role, no skill, no level mentioned at all)
-- READY: enough context to make recommendations (role or skill or job description given)
-- REFINE: user is updating/correcting a previous recommendation request
-- COMPARE: user is asking to compare two or more specific assessments
-- OFF_TOPIC: not about SHL assessment selection (legal, salary, competitor, injection, etc.)
+- VAGUE: not enough info to recommend
+- READY: enough context to recommend
+- REFINE: updating previous req
+- COMPARE: comparing assessments
+- OFF_TOPIC: not related to SHL assessments
 
 The query should be a rich semantic search string using role, skills, seniority, and test type preferences extracted from the FULL conversation history.
 """
 
-# ── Intent classifier ─────────────────────────────────────────────────────────
+
+# classify intent
 
 
 def classify_intent(messages: list[dict]) -> dict:
+
     """
-    Run a fast classification call to decide what the agent should do.
-    Returns {"intent": str, "query": str, "reason": str}
+    classify latest user intent
     """
+
     client = _get_client()
+
     classify_messages = [
         {"role": "system", "content": CLASSIFY_PROMPT},
         *messages,
@@ -136,6 +132,7 @@ def classify_intent(messages: list[dict]) -> dict:
             "content": "Now classify the intent of this conversation.",
         },
     ]
+
     resp = client.chat.completions.create(
         model=CLASSIFY_MODEL,
         messages=classify_messages,
@@ -143,104 +140,145 @@ def classify_intent(messages: list[dict]) -> dict:
         max_tokens=200,
         response_format={"type": "json_object"},
     )
+
     raw = resp.choices[0].message.content
+
     try:
         return json.loads(raw)
+
     except Exception:
-        log.warning("classify_intent parse error: %s", raw)
-        return {"intent": "VAGUE", "query": "", "reason": "parse error"}
+
+        log.warning(
+            "classify_intent parse error: %s",
+            raw
+        )
+
+        return {
+            "intent": "VAGUE",
+            "query": "",
+            "reason": "parse error"
+        }
 
 
-# ── Main agent ────────────────────────────────────────────────────────────────
+# main agent
 
 
 class SHLAgent:
-    """
-    Stateless agent: every call receives the full conversation history.
 
-    The agent:
-      1. Classifies intent
-      2. Retrieves relevant catalog items (if READY/REFINE/COMPARE)
-      3. Injects catalog context into the system prompt
-      4. Calls LLM for the final reply
-      5. Parses the structured JSON reply and returns it
+    """
+    stateless agent
+
+    flow:
+    1. classify intent
+    2. retrieve catalog items
+    3. inject context
+    4. call llm
+    5. validate output
     """
 
     def __init__(self, catalog: SHLCatalog) -> None:
+
         self.catalog = catalog
 
     def chat(self, messages: list[dict]) -> dict:
-        """
-        Process a full conversation history and return the agent response.
 
-        Returns
-        ───────
-        {
-            "reply": str,
-            "recommendations": list[dict],
-            "end_of_conversation": bool
-        }
         """
+        handles full chat history
+        """
+
         if not messages:
-            return {
-                "reply": "Hello! I can help you find the right SHL assessments. Tell me about the role you're hiring for.",
-                "recommendations": [],
-                "end_of_conversation": False,
-            }
 
-        # ── Step 1: classify intent ───────────────────────────────────────────
-        classification = classify_intent(messages)
-        intent = classification.get("intent", "VAGUE")
-        query = classification.get("query", "")
-        log.info("Intent: %s | Query: %s", intent, query)
-
-        # ── Step 2: retrieve catalog context ─────────────────────────────────
-        catalog_context = ""
-        retrieved_items: list[dict] = []
-
-        if intent in ("READY", "REFINE") and query:
-            retrieved_items = self.catalog.search(query, top_k=10)
-            catalog_context = (
-                "RELEVANT ASSESSMENTS FROM CATALOG (use ONLY these for recommendations):\n\n"
-                + self.catalog.format_for_context(retrieved_items)
-            )
-
-        elif intent == "COMPARE":
-            # Extract assessment names from the query and fetch each one
-            retrieved_items = self.catalog.search(query, top_k=10)
-            catalog_context = (
-                "ASSESSMENTS FOR COMPARISON (use ONLY this data, no prior knowledge):\n\n"
-                + self.catalog.format_for_context(retrieved_items)
-            )
-
-        elif intent == "OFF_TOPIC":
             return {
                 "reply": (
-                    "I'm only able to help with SHL assessment selection for hiring. "
-                    "I can't assist with that topic. "
-                    "Would you like help finding assessments for a specific role?"
+                    "Hello! I can help you find the right "
+                    "SHL assessments. Tell me about the role "
+                    "you're hiring for."
                 ),
                 "recommendations": [],
                 "end_of_conversation": False,
             }
 
-        # ── Step 3: build system prompt with injected context ─────────────────
+        # step 1 classify intent
+        classification = classify_intent(messages)
+
+        intent = classification.get("intent", "VAGUE")
+
+        query = classification.get("query", "")
+
+        log.info(
+            "Intent: %s | Query: %s",
+            intent,
+            query
+        )
+
+        # step 2 retrieve context
+        catalog_context = ""
+
+        retrieved_items: list[dict] = []
+
+        if intent in ("READY", "REFINE") and query:
+
+            retrieved_items = self.catalog.search(
+                query,
+                top_k=10
+            )
+
+            catalog_context = (
+                "RELEVANT ASSESSMENTS FROM CATALOG "
+                "(use ONLY these for recommendations):\n\n"
+                + self.catalog.format_for_context(retrieved_items)
+            )
+
+        elif intent == "COMPARE":
+
+            # gets assessment names from query
+            retrieved_items = self.catalog.search(
+                query,
+                top_k=10
+            )
+
+            catalog_context = (
+                "ASSESSMENTS FOR COMPARISON "
+                "(use ONLY this data, no prior knowledge):\n\n"
+                + self.catalog.format_for_context(retrieved_items)
+            )
+
+        elif intent == "OFF_TOPIC":
+
+            return {
+                "reply": (
+                    "I'm only able to help with SHL assessment "
+                    "selection for hiring. "
+                    "I can't assist with that topic. "
+                    "Would you like help finding assessments "
+                    "for a specific role?"
+                ),
+                "recommendations": [],
+                "end_of_conversation": False,
+            }
+
+        # step 3 build prompt
         system_content = SYSTEM_PROMPT
+
         if catalog_context:
             system_content += f"\n\n{catalog_context}"
+
         if intent == "VAGUE":
+
             system_content += (
                 "\n\nINSTRUCTION: The user's request is too vague to recommend. "
                 "Ask exactly ONE targeted clarifying question about the role, "
                 "seniority level, or skill focus. Do not recommend yet."
             )
 
-        # ── Step 4: call LLM for reply ────────────────────────────────────────
+        # step 4 llm call
         client = _get_client()
+
         llm_messages = [
             {"role": "system", "content": system_content},
             *messages,
         ]
+
         resp = client.chat.completions.create(
             model=MODEL,
             messages=llm_messages,
@@ -248,69 +286,120 @@ class SHLAgent:
             max_tokens=900,
             response_format={"type": "json_object"},
         )
+
         raw = resp.choices[0].message.content
+
         log.debug("LLM raw: %s", raw[:300])
 
-        # ── Step 5: parse and validate response ───────────────────────────────
+        # step 5 parse response
         parsed = _parse_llm_response(raw)
-        validated = _validate_recommendations(parsed, self.catalog)
+
+        validated = _validate_recommendations(
+            parsed,
+            self.catalog
+        )
+
         return validated
 
 
-# ── Response parsing & validation ─────────────────────────────────────────────
+# response parsing
 
 
 def _parse_llm_response(raw: str) -> dict:
-    """Parse LLM JSON output with graceful fallback."""
+
+    """parse llm output"""
+
     try:
+
         data = json.loads(raw)
+
     except json.JSONDecodeError:
-        # Try extracting JSON from markdown fences
+
+        # trying regex fallback
         match = re.search(r"\{.*\}", raw, re.DOTALL)
+
         if match:
+
             try:
                 data = json.loads(match.group())
+
             except Exception:
                 data = {}
+
         else:
             data = {}
 
     return {
-        "reply": str(data.get("reply", "I'm sorry, I encountered an error. Please try again.")),
+        "reply": str(
+            data.get(
+                "reply",
+                "I'm sorry, I encountered an error. Please try again."
+            )
+        ),
+
         "recommendations": data.get("recommendations", []),
-        "end_of_conversation": bool(data.get("end_of_conversation", False)),
+
+        "end_of_conversation": bool(
+            data.get("end_of_conversation", False)
+        ),
     }
 
 
-def _validate_recommendations(parsed: dict, catalog: SHLCatalog) -> dict:
+def _validate_recommendations(
+    parsed: dict,
+    catalog: SHLCatalog
+) -> dict:
+
     """
-    Critical: ensure every recommendation URL exists in the catalog.
-    Drop any hallucinated items. Cap at 10.
+    validates recommendations
+    removes hallucinated ones
     """
+
     raw_recs = parsed.get("recommendations", [])
+
     if not isinstance(raw_recs, list):
         raw_recs = []
 
     valid_recs = []
+
     for rec in raw_recs[:10]:
+
         if not isinstance(rec, dict):
             continue
+
         url = rec.get("url", "")
+
         name = rec.get("name", "")
 
-        # Verify against catalog
-        catalog_item = catalog.get_by_url(url) or catalog.get_by_name(name)
+        # checking catalog
+        catalog_item = (
+            catalog.get_by_url(url)
+            or catalog.get_by_name(name)
+        )
+
         if catalog_item is None:
-            log.warning("Dropping hallucinated recommendation: %s / %s", name, url)
+
+            log.warning(
+                "Dropping hallucinated recommendation: %s / %s",
+                name,
+                url
+            )
+
             continue
 
-        # Normalise fields from ground truth
-        test_type_code = _keys_to_code(catalog_item.get("keys", []))
+        # normalize data
+        test_type_code = _keys_to_code(
+            catalog_item.get("keys", [])
+        )
+
         valid_recs.append(
             {
                 "name": catalog_item["name"],
                 "url": catalog_item["url"],
-                "test_type": rec.get("test_type", test_type_code),
+                "test_type": rec.get(
+                    "test_type",
+                    test_type_code
+                ),
             }
         )
 
@@ -335,4 +424,8 @@ _KEY_TO_LETTER = {
 
 
 def _keys_to_code(keys: list[str]) -> str:
-    return "".join(_KEY_TO_LETTER.get(k, "?") for k in keys)
+
+    return "".join(
+        _KEY_TO_LETTER.get(k, "?")
+        for k in keys
+    )
